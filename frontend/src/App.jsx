@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import io from "socket.io-client";
+import {io} from "socket.io-client";
 import "./App.css";
 
 // ⚠️ change this to your backend IP
-const socket = io("http://192.168.29.193:5002", {
+const socket = io({
   transports: ["websocket"],
+  upgrade: false
 });
 
 function App() {

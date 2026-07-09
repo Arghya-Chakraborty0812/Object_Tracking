@@ -9,11 +9,11 @@ app = Flask(__name__)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading"
+    async_mode="threading",
 )
 
 # Load your trained model
-model = YOLO("best-2.pt")
+model = YOLO("yolov8n.pt")
 
 
 @socketio.on('frame')
