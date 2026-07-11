@@ -1,8 +1,8 @@
 from flask import Flask
 from flask_socketio import SocketIO, emit
-import base64
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 app = Flask(__name__)
@@ -10,66 +10,55 @@ socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode="threading",
+    max_http_buffer_size=10_000_000,  # allow larger binary frames if needed
 )
 
-# Load your trained model
-model = YOLO("yolov8n.pt")
+# Load your trained model — force GPU if available, since CPU inference
+# is almost always the actual bottleneck causing "lag" in real-time streams
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🖥️ Running inference on: {device}")
+
+model = YOLO("best-2.pt")
+model.to(device)
 
 
 @socketio.on('frame')
 def handle_frame(data):
     try:
-        print("\n📩 Frame received")
-
-        # Decode base64 image
-        img_data = base64.b64decode(data.split(',')[1])
-        np_arr = np.frombuffer(img_data, np.uint8)
+        # data arrives as raw bytes (ArrayBuffer sent from the client) —
+        # no base64 decoding needed anymore
+        np_arr = np.frombuffer(data, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         if frame is None:
-            print("❌ Frame decode failed")
             return
-
-        print(f"✅ Frame shape: {frame.shape}")
 
         # Run tracking
         results = model.track(
             frame,
-            tracker="botsort.yaml",
+            tracker="bytetrack.yaml",
             persist=True,
-            conf=0.4
+            conf=0.4,
+            device=device,
+            verbose=False,  # skip Ultralytics' own per-frame console logging, it's not free
         )
 
         r = results[0]
 
-        # 🔍 DEBUG DETECTIONS
-        if r.boxes is None:
-            print("❌ No detections")
-        else:
-            print(f"✅ Detections found: {len(r.boxes)}")
-
-            # Confidence scores
-            print("📊 Conf:", r.boxes.conf.cpu().numpy())
-
-            # Classes
-            print("🏷 Classes:", r.boxes.cls.cpu().numpy())
-
-            # Tracking IDs
-            if r.boxes.id is not None:
-                print("🆔 IDs:", r.boxes.id.cpu().numpy())
-            else:
-                print("⚠️ No tracking IDs (tracker not active)")
-
         # Draw boxes
         annotated = r.plot()
 
-        # Encode back
-        _, buffer = cv2.imencode('.jpg', annotated)
-        encoded = base64.b64encode(buffer).decode('utf-8')
+        # Encode as JPEG and send raw bytes — no base64 involved
+        success, buffer = cv2.imencode('.jpg', annotated)
+        if not success:
+            print("❌ JPEG encode failed")
+            return
 
-        emit('result', f"data:image/jpeg;base64,{encoded}")
+        emit('result', buffer.tobytes())
 
     except Exception as e:
         print("🔥 Error:", e)
+
+
 if __name__ == '__main__':
     socketio.run(app, host="0.0.0.0", port=5002)

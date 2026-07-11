@@ -19,6 +19,8 @@ function App() {
 
   const lastFrameTime = useRef(Date.now());
   const streamRef = useRef(null);
+  const sendingRef = useRef(false); // in-flight guard: true while a frame is being sent AND awaiting its result
+  const streamingRef = useRef(true); // mirrors `streaming` state for use inside the socket callback
 
   // Start camera
   useEffect(() => {
@@ -35,16 +37,36 @@ function App() {
       console.error("Socket connect error:", err.message, err)
     );
 
-    socket.on("result", (data) => {
+    // data arrives as raw binary (ArrayBuffer) instead of a base64 string
+    socket.on("result", (buffer) => {
       const now = Date.now();
       const delta = now - lastFrameTime.current;
       lastFrameTime.current = now;
       setFps(delta > 0 ? Math.round(1000 / delta) : 0);
       setFrameCount((c) => c + 1);
-      setOutput(data);
+
+      const blob = new Blob([buffer], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+
+      setOutput((prevUrl) => {
+        if (prevUrl) URL.revokeObjectURL(prevUrl); // avoid leaking old blob URLs
+        return url;
+      });
+
+      sendingRef.current = false; // server is done with the last frame — safe to send the next one
+      if (streamingRef.current) sendFrame(); // immediately queue the next frame, no fixed delay
     });
 
-    return () => socket.disconnect();
+    return () => {
+      socket.off("connect");
+      socket.off("disconnect");
+      socket.off("connect_error");
+      socket.off("result");
+      socket.disconnect();
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    };
   }, []);
 
   // Clock tick
@@ -53,30 +75,59 @@ function App() {
     return () => clearInterval(t);
   }, []);
 
-  // Send frames
+  // Send a frame as raw binary. Self-chains off the "result" handler above —
+  // no fixed interval, so the client never gets ahead of what the server can process.
   const sendFrame = () => {
+    if (!streamingRef.current) return;
     const video = videoRef.current;
-    if (!video || video.readyState !== 4) return;
+    if (!video || video.readyState !== 4) {
+      // camera not ready yet — retry shortly instead of dropping the loop
+      setTimeout(sendFrame, 100);
+      return;
+    }
+    if (sendingRef.current) return; // a frame is already in flight, awaiting its result
+
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
     canvas.width = 640;
     canvas.height = 480;
     ctx.drawImage(video, 0, 0, 640, 480);
-    const data = canvas.toDataURL("image/jpeg", 0.6);
-    socket.emit("frame", data);
+
+    sendingRef.current = true;
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          sendingRef.current = false;
+          return;
+        }
+        blob.arrayBuffer().then((buffer) => {
+          socket.emit("frame", buffer);
+          // sendingRef stays true until the "result" event fires — that's what
+          // throttles the loop to the server's actual processing speed
+        });
+      },
+      "image/jpeg",
+      0.6
+    );
   };
 
+  // Kick off / stop the self-chaining send loop when streaming is toggled
   useEffect(() => {
-    if (!streaming) return;
-    const interval = setInterval(sendFrame, 150);
-    return () => clearInterval(interval);
+    streamingRef.current = streaming;
+    if (streaming) {
+      sendingRef.current = false;
+      sendFrame();
+    }
   }, [streaming]);
 
   const toggleStreaming = () => {
     setStreaming((prev) => {
       const next = !prev;
       if (!next) {
-        setOutput("");
+        setOutput((prevUrl) => {
+          if (prevUrl) URL.revokeObjectURL(prevUrl);
+          return "";
+        });
         setFps(0);
       }
       return next;
@@ -117,7 +168,6 @@ function App() {
             <span className="stat-label">{dateStr}</span>
             <span className="stat-value mono-time">{timeStr}</span>
           </div>
-          
         </div>
       </header>
 
@@ -146,14 +196,13 @@ function App() {
         </section>
 
         <aside className="side-panel">
-        <button
+          <button
             className={`stream-btn ${streaming ? "is-active" : ""}`}
             onClick={toggleStreaming}
           >
             {streaming ? "■ STOP" : "▶ START"}
           </button>
           <div className="panel-block">
-            
             <h3>SESSION</h3>
             <div className="kv">
               <span>Status</span>
@@ -163,11 +212,11 @@ function App() {
             </div>
             <div className="kv">
               <span>Transport</span>
-              <span>WebSocket</span>
+              <span>WebSocket (binary)</span>
             </div>
             <div className="kv">
-              <span>Interval</span>
-              <span>150ms</span>
+              <span>Mode</span>
+              <span>Adaptive (ack-driven)</span>
             </div>
           </div>
 
